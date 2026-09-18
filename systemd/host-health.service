@@ -1,0 +1,15 @@
+[Unit]
+Description=Linux host health check
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Change WorkingDirectory to wherever you cloned the repo.
+WorkingDirectory=/opt/linux-host-health
+Environment=HEALTH_CONF=/opt/linux-host-health/health.conf
+ExecStart=/opt/linux-host-health/check.sh -j /var/log/host-health.json
+StandardOutput=append:/var/log/host-health.log
+StandardError=append:/var/log/host-health.log
+
+[Install]
+WantedBy=multi-user.target
