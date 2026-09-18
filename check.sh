@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# linux-host-health — inspect one Linux host and report what a DC tech actually checks.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="${HEALTH_CONF:-$SCRIPT_DIR/health.conf}"
+JSON_OUT=""
+QUIET=0
+
+usage() {
+  cat <<'EOF'
+Usage: check.sh [options]
+
+Options:
+  -c FILE    Config file (default: ./health.conf or $HEALTH_CONF)
+  -j FILE    Also write JSON to FILE
+  -q         Quiet: print only FAIL/WARN lines
+  -h         Help
+
+Exit codes:
+  0  all checks passed
+  1  one or more WARN
+  2  one or more FAIL
+  3  usage / config error
+EOF
+}
+
+while getopts ":c:j:qh" opt; do
+  case "$opt" in
+    c) CONFIG="$OPTARG" ;;
+    j) JSON_OUT="$OPTARG" ;;
+    q) QUIET=1 ;;
+    h) usage; exit 0 ;;
+    *) usage; exit 3 ;;
+  esac
+done
+
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
+DISK_WARN_PCT="${DISK_WARN_PCT:-80}"
+DISK_FAIL_PCT="${DISK_FAIL_PCT:-90}"
+LOAD_WARN_MULT="${LOAD_WARN_MULT:-1}"
+LOAD_FAIL_MULT="${LOAD_FAIL_MULT:-2}"
+MEM_WARN_PCT="${MEM_WARN_PCT:-85}"
+MEM_FAIL_PCT="${MEM_FAIL_PCT:-95}"
+AUTH_FAIL_WARN="${AUTH_FAIL_WARN:-10}"
+AUTH_WINDOW_MIN="${AUTH_WINDOW_MIN:-60}"
+CHECK_UNITS="${CHECK_UNITS:-1}"
+CHECK_LISTENERS="${CHECK_LISTENERS:-1}"
+CHECK_AUTH="${CHECK_AUTH:-1}"
+
+PASS=0
+WARN=0
+FAIL=0
+declare -a LINES=()
+declare -a JSON_PARTS=()
+
+log_line() {
+  local level="$1"
+  local msg="$2"
+  LINES+=("$level|$msg")
+  if [[ "$QUIET" -eq 0 || "$level" == "WARN" || "$level" == "FAIL" ]]; then
+    printf '%-5s %s\n' "$level" "$msg"
+  fi
+}
+
+record() {
+  local level="$1"
+  local key="$2"
+  local msg="$3"
+  local extra="${4:-}"
+  case "$level" in
+    PASS) PASS=$((PASS + 1)) ;;
+    WARN) WARN=$((WARN + 1)) ;;
+    FAIL) FAIL=$((FAIL + 1)) ;;
+  esac
+  log_line "$level" "$msg"
+  JSON_PARTS+=("{\"check\":\"$key\",\"level\":\"$level\",\"message\":$(printf '%s' "$msg" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "${msg//"/\"}")${extra}}")
+}
+
+ncpus() {
+  nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1
+}
+
+check_identity() {
+  local host os kernel
+  host="$(hostname -f 2>/dev/null || hostname)"
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os="${PRETTY_NAME:-$ID}"
+  else
+    os="unknown"
+  fi
+  kernel="$(uname -r)"
+  record PASS identity "host=$host os=$os kernel=$kernel"
+}
+
+check_uptime() {
+  local up
+  up="$(uptime -p 2>/dev/null || awk '{print $1}' /proc/uptime)"
+  record PASS uptime "$up"
+}
+
+check_load() {
+  local cpus l1 l5 l15 warn_at fail_at
+  cpus="$(ncpus)"
+  read -r l1 l5 l15 _ < /proc/loadavg
+  warn_at="$(awk -v c="$cpus" -v m="$LOAD_WARN_MULT" 'BEGIN{printf "%.2f", c*m}')"
+  fail_at="$(awk -v c="$cpus" -v m="$LOAD_FAIL_MULT" 'BEGIN{printf "%.2f", c*m}')"
+  local level=PASS
+  awk -v l="$l1" -v f="$fail_at" 'BEGIN{exit !(l+0 >= f+0)}' && level=FAIL
+  if [[ "$level" == PASS ]]; then
+    awk -v l="$l1" -v w="$warn_at" 'BEGIN{exit !(l+0 >= w+0)}' && level=WARN
+  fi
+  record "$level" load "load1=$l1 load5=$l5 load15=$l15 cpus=$cpus warn>=$warn_at fail>=$fail_at"
+}
+
+check_memory() {
+  local total avail used_pct
+  total="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+  avail="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
+  if [[ -z "$avail" ]]; then
+    avail="$(awk '/MemFree:/ {print $2}' /proc/meminfo)"
+  fi
+  used_pct="$(awk -v t="$total" -v a="$avail" 'BEGIN{printf "%d", (t-a)*100/t}')"
+  local level=PASS
+  if (( used_pct >= MEM_FAIL_PCT )); then level=FAIL
+  elif (( used_pct >= MEM_WARN_PCT )); then level=WARN
+  fi
+  record "$level" memory "used=${used_pct}% total_kb=$total available_kb=$avail warn>=${MEM_WARN_PCT}% fail>=${MEM_FAIL_PCT}%"
+}
+
+check_disks() {
+  local worst=PASS
+  local any=0
+  while read -r pct mp; do
+    any=1
+    pct="${pct%\%}"
+    local level=PASS
+    if (( pct >= DISK_FAIL_PCT )); then level=FAIL
+    elif (( pct >= DISK_WARN_PCT )); then level=WARN
+    fi
+    record "$level" disk "mount=$mp used=${pct}% warn>=${DISK_WARN_PCT}% fail>=${DISK_FAIL_PCT}%"
+    if [[ "$level" == FAIL ]]; then worst=FAIL
+    elif [[ "$level" == WARN && "$worst" == PASS ]]; then worst=WARN
+    fi
+  done < <(df -P -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | awk 'NR>1 && $6 !~ /^\/snap/ {print $5, $6}')
+  if [[ "$any" -eq 0 ]]; then
+    record WARN disk "no local filesystems reported by df"
+  fi
+}
+
+check_units() {
+  [[ "$CHECK_UNITS" == "1" ]] || return 0
+  if ! command -v systemctl >/dev/null 2>&1; then
+    record WARN units "systemctl not available"
+    return 0
+  fi
+  local failed
+  failed="$(systemctl --failed --no-legend --no-pager 2>/dev/null | awk '{print $1}' | paste -sd, -)"
+  if [[ -z "$failed" ]]; then
+    record PASS units "no failed systemd units"
+  else
+    record FAIL units "failed=$failed"
+  fi
+}
+
+check_listeners() {
+  [[ "$CHECK_LISTENERS" == "1" ]] || return 0
+  local out
+  if command -v ss >/dev/null 2>&1; then
+    out="$(ss -tuln 2>/dev/null | awk 'NR>1 {print $1,$5}' | head -n 30 | paste -sd '; ' -)"
+  elif command -v netstat >/dev/null 2>&1; then
+    out="$(netstat -tuln 2>/dev/null | awk 'NR>2 {print $1,$4}' | head -n 30 | paste -sd '; ' -)"
+  else
+    record WARN listeners "ss/netstat not available"
+    return 0
+  fi
+  record PASS listeners "${out:-none}"
+}
+
+check_auth() {
+  [[ "$CHECK_AUTH" == "1" ]] || return 0
+  local count=0
+  local log=""
+  for candidate in /var/log/auth.log /var/log/secure; do
+    if [[ -r "$candidate" ]]; then
+      log="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$log" ]]; then
+    if command -v journalctl >/dev/null 2>&1; then
+      count="$(journalctl -u ssh -u sshd --since "${AUTH_WINDOW_MIN} min ago" --no-pager 2>/dev/null | grep -ciE 'failed password|authentication failure' || true)"
+      local level=PASS
+      if (( count >= AUTH_FAIL_WARN )); then level=WARN; fi
+      record "$level" auth "failed_auth_approx=$count window_min=$AUTH_WINDOW_MIN source=journalctl warn>=$AUTH_FAIL_WARN"
+      return 0
+    fi
+    record WARN auth "no readable auth log and no journalctl"
+    return 0
+  fi
+  if command -v journalctl >/dev/null 2>&1; then
+    count="$(journalctl --since "${AUTH_WINDOW_MIN} min ago" --no-pager 2>/dev/null | grep -ciE 'failed password|authentication failure' || true)"
+  else
+    count="$(grep -ciE 'failed password|authentication failure' "$log" || true)"
+  fi
+  local level=PASS
+  if (( count >= AUTH_FAIL_WARN )); then level=WARN; fi
+  record "$level" auth "failed_auth_approx=$count window_min=$AUTH_WINDOW_MIN source=$log warn>=$AUTH_FAIL_WARN"
+}
+
+echo "linux-host-health  $(date -Is)"
+echo "config            $CONFIG"
+echo
+
+check_identity
+check_uptime
+check_load
+check_memory
+check_disks
+check_units
+check_listeners
+check_auth
+
+echo
+printf 'summary  PASS=%s WARN=%s FAIL=%s\n' "$PASS" "$WARN" "$FAIL"
+
+if [[ -n "$JSON_OUT" ]]; then
+  {
+    printf '{"generated":"%s","pass":%s,"warn":%s,"fail":%s,"checks":[' "$(date -Is)" "$PASS" "$WARN" "$FAIL"
+    local i=0
+    for part in "${JSON_PARTS[@]}"; do
+      (( i++ )) && true
+      printf '%s' "$part"
+      if (( i < ${#JSON_PARTS[@]} )); then printf ','; fi
+    done
+    printf ']}\n'
+  } > "$JSON_OUT"
+  echo "json     $JSON_OUT"
+fi
+
+if (( FAIL > 0 )); then exit 2; fi
+if (( WARN > 0 )); then exit 1; fi
+exit 0
