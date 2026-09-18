@@ -1,0 +1,14 @@
+linux-host-health  2026-09-18T03:00:00-05:00
+config            ./health.conf
+
+PASS  host=lab.example os=Ubuntu 24.04.3 LTS kernel=6.8.0-71-generic
+PASS  up 3 days, 4 hours
+PASS  load1=0.12 load5=0.18 load15=0.09 cpus=4 warn>=4.00 fail>=8.00
+PASS  used=41% total_kb=16320664 available_kb=9612344 warn>=85% fail>=95%
+PASS  mount=/ used=37% warn>=80% fail>=90%
+PASS  mount=/boot used=22% warn>=80% fail>=90%
+PASS  no failed systemd units
+PASS  tcp 0.0.0.0:22; tcp 127.0.0.1:631; udp 0.0.0.0:68
+PASS  failed_auth_approx=0 window_min=60 source=/var/log/auth.log warn>=10
+
+summary  PASS=9 WARN=0 FAIL=0
