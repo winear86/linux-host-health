@@ -93,6 +93,15 @@ ncpus() {
   nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1
 }
 
+skip_mount() {
+  case "$1" in
+    /snap/*|/sys/*|/proc/*|/dev/*|/run/*) return 0 ;;
+    /init|/mnt/wslg|/mnt/wslg/*) return 0 ;;
+    /usr/lib/wsl/*|/usr/lib/modules/*) return 0 ;;
+  esac
+  return 1
+}
+
 check_identity() {
   local host os kernel
   host="$(hostname -f 2>/dev/null || hostname)"
@@ -147,6 +156,7 @@ check_memory() {
 check_disks() {
   local any=0 pct mp level
   while read -r pct mp; do
+    skip_mount "$mp" && continue
     any=1
     pct="${pct%%%}"
     level=PASS
