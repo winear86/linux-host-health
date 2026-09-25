@@ -189,16 +189,27 @@ check_units() {
 
 check_listeners() {
   [[ "$CHECK_LISTENERS" == "1" ]] || return 0
-  local out
+  local ports ssh="no" count=0
   if command -v ss >/dev/null 2>&1; then
-    out="$(ss -tuln 2>/dev/null | awk 'NR > 1 { print $1, $5 }' | head -n 30 | paste -sd '; ' -)"
+    ports="$(ss -tuln 2>/dev/null | awk 'NR > 1 {
+      split($5, a, ":")
+      p=a[length(a)]
+      if (p != "" && p != "*") print p
+    }' | sort -n | uniq)"
   elif command -v netstat >/dev/null 2>&1; then
-    out="$(netstat -tuln 2>/dev/null | awk 'NR > 2 { print $1, $4 }' | head -n 30 | paste -sd '; ' -)"
+    ports="$(netstat -tuln 2>/dev/null | awk 'NR > 2 {
+      n=split($4, a, ":")
+      print a[n]
+    }' | sort -n | uniq)"
   else
     record WARN listeners "ss/netstat not available"
     return 0
   fi
-  record PASS listeners "${out:-none}"
+  if [[ -n "$ports" ]]; then
+    count="$(printf '%s\n' "$ports" | grep -c . || true)"
+    printf '%s\n' "$ports" | grep -qx '22' && ssh="yes"
+  fi
+  record PASS listeners "port_count=${count} ssh=${ssh} ports=$(printf '%s' "$ports" | tr '\n' ',' | sed 's/,$//')"
 }
 
 check_auth() {
